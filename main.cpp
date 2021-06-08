@@ -1,4 +1,5 @@
 #include <iostream>
+#include "Util.h"
 
 class State {
 	public:
@@ -48,8 +49,51 @@ void writeState(State state) {
 	fclose(stateFile);
 }
 
+/*
+        let valuePath = gpioBasePath + "gpio" + pin + "/value";
+        let directionPath = gpioBasePath + "gpio" + pin + "/direction";
+        if (!fs.existsSync(valuePath)) {
+            fs.writeFileSync(gpioBasePath + 'export', "" + pin);
+        }
+        if (fs.readFileSync(directionPath).toString() != "out\n") {
+            console.log("updated direction of " + pin);
+            fs.writeFileSync(directionPath, "out");
+        }
+        let value = state ? "0\n" : "1\n";
+
+        if (fs.readFileSync(valuePath).toString() != value || force) {
+            console.log("updated value of " + pin);
+            fs.writeFileSync(valuePath, value);
+            postdata.push([dateformat(ts, "yyyy-mm-dd HH:MM:ss"), id, (state ? 1 : 0) | (auto << 1), relais]);
+        }
+    } else {
+      postdata.push([dateformat(ts, "yyyy-mm-dd HH:MM:ss"), id, (state ? 1 : 0), relais]);
+    }
+}
+ */
+
+const char gpioBasePath[] = "/sys/class/gpio/";
+const char directionOut[] = "out\n";
+
+void writeGpio(int pin, bool on) {
+	const auto valuePath = format("%s/gpio%d/value", gpioBasePath, pin);
+	const auto directionPath = format("%s/gpio%d/direction", gpioBasePath, pin);
+	if (not fileExists(valuePath.c_str())) {
+		writeFile(format("%s/export", gpioBasePath).c_str(), format("%d", pin).c_str());
+	}
+	if (readFileMax1024byte(directionPath.c_str()) != directionOut) {
+		writeFile(directionPath.c_str(), directionOut);
+	}
+	const char* value = on ? "0\n" : "1\n";
+
+	if (readFileMax1024byte(valuePath.c_str()) != value) {
+		writeFile(valuePath.c_str(), value);
+	}
+}
+
 void writeGpio(bool on) {
-	
+	const int IRRIGATION_GPIO = 198;
+	writeGpio(IRRIGATION_GPIO, on);
 }
 
 State turnOn(State state) {

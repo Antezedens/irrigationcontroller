@@ -3,4 +3,4 @@ project(irrigation)
 
 set(CMAKE_CXX_STANDARD 14)
 
-add_executable(irrigation main.cpp)
+add_executable(irrigation main.cpp Util.cpp)
