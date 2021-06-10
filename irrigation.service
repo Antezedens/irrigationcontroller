@@ -1,0 +1,11 @@
+[Unit]
+Description=Irrigation
+
+[Service]
+ExecStart=/root/irrigationcontroller/irrigation
+WorkingDirectory=/root/irrigationcontroller
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
