@@ -131,11 +131,12 @@ void turnOn(State& state, double minutes) {
 	writeGpio(true);
 }
 
-void turnOff(State& state, double minutes) {
-	syslog(LOG_INFO, "Turn off: %d for %.1f min", state.getPosition(), minutes);
+void turnOff(State& state) {
+	syslog(LOG_INFO, "Turn off: %d for %.1f min", state.getPosition(), static_cast<double>(SLEEP_SECONDS_AFTER_TURN_OFF) / 60.0);
 	state.turnOff();
 	writeState(state);
 	writeGpio(false);
+	sleepAtLeast(SLEEP_SECONDS_AFTER_TURN_OFF);
 }
 
 enum class CommandType {
@@ -187,8 +188,7 @@ void open_for(Context* context, int duration_in_seconds) {
 							   std::chrono::seconds(time_to_sleep),
 							   [context] { return context->hasCommand(); });
 	}
-	turnOff(context->state, static_cast<double>(SLEEP_SECONDS_AFTER_TURN_OFF));
-	sleepAtLeast(SLEEP_SECONDS_AFTER_TURN_OFF);
+	turnOff(context->state);
 }
 
 void goto_valve(int position, Context* context) {
