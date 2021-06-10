@@ -1,31 +1,50 @@
 #include <iostream>
+#include <cstring>
+#include <sys/syslog.h>
 #include "Util.h"
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <condition_variable>
+#include <csignal>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <vector>
+#include <sstream>
+#include <array>
+#include <unistd.h>
+
+using namespace std;
+
+static constexpr int VALVE_COUNT = 6;
+static constexpr int MAX_VALVE_COUNT = 6;
+static constexpr int SLEEP_SECONDS_AFTER_TURN_OFF = 45;
+static constexpr int SLEEP_SECONDS_AFTER_TURN_ON = 10;
 
 class State {
 	public:
 		explicit State(int theState) : state(theState) {}
 
-		const int state;
+		int state;
 
 		int getPosition() const {
 			return state & ~FLAG_ON;
 		}
 		int getNextPosition() {
-			return (getPosition() + 1) % POSITION_COUNT;
+			return (getPosition() + 1) % VALVE_COUNT;
 		}
 		int isOn() {
 			return (state & FLAG_ON) != 0;
 		}
 
-		State turnOn() {
-			return State(state | FLAG_ON);
+		void turnOn() {
+			state |= FLAG_ON;
 		}
-		State turnOff() {
-			return State(getNextPosition());
+		void turnOff() {
+			state = getNextPosition();
 		}
 
 		static constexpr int FLAG_ON = 0x8000;
-		static constexpr int POSITION_COUNT = 6;
 };
 
 State readState() {
@@ -38,6 +57,15 @@ State readState() {
 	fscanf(state, "%d", &stateInt);
 	fclose(state);
 	return State(stateInt);
+}
+
+void sleepAtLeast(int seconds) {
+	struct timespec ts, rem;
+	ts.tv_sec = seconds;
+	ts.tv_nsec = 0;
+	while (nanosleep(&ts, &rem) && errno == EINTR) {
+		ts = rem;
+	}
 }
 
 void writeState(State state) {
@@ -96,51 +124,197 @@ void writeGpio(bool on) {
 	writeGpio(IRRIGATION_GPIO, on);
 }
 
-State turnOn(State state) {
-	auto nextState = state.turnOn();
-	writeState(nextState);
+void turnOn(State& state, double minutes) {
+	syslog(LOG_INFO, "Turn on: %d for %.1f min", state.getPosition(), minutes);
+	state.turnOn();
+	writeState(state);
 	writeGpio(true);
-	return nextState;
 }
 
-State turnOff(State state) {
-	auto nextState = state.turnOff();
-	writeState(nextState);
+void turnOff(State& state, double minutes) {
+	syslog(LOG_INFO, "Turn off: %d for %.1f min", state.getPosition(), minutes);
+	state.turnOff();
+	writeState(state);
 	writeGpio(false);
-	return nextState;
+}
+
+enum class CommandType {
+		QUIT,
+		STOP,
+		IRRIGATION_CYCLE,
+};
+
+struct Command {
+	CommandType type;
+	array<int, MAX_VALVE_COUNT> duration;
+};
+
+class Context {
+	public:
+		explicit Context(State theState)
+			: state(theState) {}
+
+		std::mutex mutex;
+		std::unique_ptr<Command> command;
+		std::condition_variable cond;
+		State state;
+
+		bool hasCommand() const {
+			return command.get() != nullptr;
+		}
+
+		std::unique_ptr<Command> consumeCommand() {
+			return std::move(command);
+		}
+
+		void postCommand(Command cmd) {
+			{
+				std::unique_lock<std::mutex> lk(mutex);
+				command = std::make_unique<Command>(cmd);
+			}
+			cond.notify_all();
+		}
+};
+
+void open_for(Context* context, int duration_in_seconds) {
+	turnOn(context->state, static_cast<double>(duration_in_seconds) / 60.0);
+	sleepAtLeast(SLEEP_SECONDS_AFTER_TURN_ON);
+
+	const int time_to_sleep = duration_in_seconds - SLEEP_SECONDS_AFTER_TURN_ON;
+	if (time_to_sleep > 0) {
+		std::unique_lock<std::mutex> lk(context->mutex);
+		context->cond.wait_for(lk,
+							   std::chrono::seconds(time_to_sleep),
+							   [context] { return context->hasCommand(); });
+	}
+	turnOff(context->state, static_cast<double>(SLEEP_SECONDS_AFTER_TURN_OFF));
+	sleepAtLeast(SLEEP_SECONDS_AFTER_TURN_OFF);
+}
+
+void goto_valve(int position, Context* context) {
+	while (context->state.getPosition() != position) {
+		open_for(context, SLEEP_SECONDS_AFTER_TURN_ON);
+	}
+}
+
+void do_cycle(Context* context, const Command& command) {
+	goto_valve(0, context);
+	for (int i=0; i<VALVE_COUNT; ++i) {
+		open_for(context, command.duration[i]);
+	}
+}
+
+void worker(Context* context) {
+
+	std::unique_ptr<Command> nextCommand;
+	bool run = true;
+	do {
+		{
+			std::unique_lock<std::mutex> lk(context->mutex);
+			context->cond.wait(lk, [context] { return context->hasCommand(); });
+			nextCommand = context->consumeCommand();
+		}
+
+		switch (nextCommand->type) {
+			case CommandType::QUIT:
+				run = false;
+				break;
+			case CommandType::STOP:
+				break;
+			case CommandType::IRRIGATION_CYCLE:
+				do_cycle(context, *nextCommand);
+				break;
+		}
+	} while (run);
+}
+
+const char pipeName[] = "/tmp/irrigation.pipe";
+
+void signalHandler(int signal) {
+	FILE* f = fopen(pipeName, "w");
+	fprintf(f, "quit\n");
+	fclose(f);
+}
+
+deque<string> split(const char* s, char delim) {
+	deque<string> result;
+	stringstream ss (s);
+	string item;
+
+	while (getline (ss, item, delim)) {
+		result.push_back (item);
+	}
+
+	return result;
 }
 
 int main() {
-	FILE* pipe = fopen("/tmp/irrigation.pipe", "r");
 
-	auto state = readState();
-	if (state.isOn()) {
-
+	Context context(readState());
+	if (context.state.isOn()) {
+		turnOff(context.state);
 	}
 
-	fd_set rfds;
-	struct timeval tv;
-	int retval;
+	signal(SIGINT, signalHandler);
+	signal(SIGTERM, signalHandler);
 
-	FD_ZERO(&rfds);
-	FD_SET(fileno(pipe), &rfds);
+	std::thread workerThread(worker, &context);
 
-	/* Wait up to five seconds. */
+	mkfifo(pipeName, 0666);
+	FILE* pipe = fopen(pipeName, "wr+");
 
-	tv.tv_sec = 5;
-	tv.tv_usec = 0;
+	do {
+		char buffer[1024];
+		while (fgets(buffer, 1024, pipe)) {
+			syslog(LOG_INFO, "command: %s", buffer);
+			if (buffer[0] == '\0') {
+				continue;
+			}
+			auto len = strlen(buffer);
+			if (buffer[len-1] == '\n') buffer[len-1] = '\0';
+			auto parts = split(buffer, ' ');
+			if (parts.empty()) {
+				continue;
+			}
+			if (not strcasecmp(parts[0].c_str(), "quit")) {
+				context.postCommand({CommandType::QUIT});
+				workerThread.join();
+				return 0;
+			}
+			if (not strcasecmp(parts[0].c_str(), "stop")) {
+				context.postCommand({CommandType::STOP});
+			}
+			if (not strcasecmp(parts[0].c_str(), "cycle")) {
+				if (parts.size() < VALVE_COUNT + 1) {
+					syslog(LOG_ERR, "Need cycle times for %d valves", VALVE_COUNT);
+				} else {
+					Command cmd = {CommandType::IRRIGATION_CYCLE};
+					for (int i=1; i<parts.size(); ++i) {
+						cmd.duration[i-1] = strtod(parts[i].c_str(), nullptr) * 60;
+					}
+					context.postCommand(cmd);
+				}
+			}
+			if (not strcasecmp(parts[0].c_str(), "valve")) {
+				if (parts.size() < 3) {
+					syslog(LOG_ERR, "Need valve and cycle time");
+				} else {
+					Command cmd = {CommandType::IRRIGATION_CYCLE};
+					fill(cmd.duration.begin(), cmd.duration.end(), 0);
+					int valve = strtol(parts[1].c_str(), nullptr, 10);
+					if (valve < 0 || valve >= VALVE_COUNT) {
+						syslog(LOG_ERR, "Invalid valve %d (max: %d)", valve, VALVE_COUNT);
+					} else {
+						cmd.duration[valve] = strtod(parts[2].c_str(), nullptr) * 60;
+						context.postCommand(cmd);
+					}
+				}
+			}
+			if (not strcasecmp(parts[0].c_str(), "status")) {
+				syslog(LOG_INFO, "valve is: %d, %s", context.state.getPosition(), context.state.isOn() ? "on" : "off");
+			}
+		}
 
-	retval = select(1, &rfds, NULL, NULL, &tv);
-	/* Don't rely on the value of tv now! */
+	} while (true);
 
-	if (retval == -1)
-		perror("select()");
-	else if (retval)
-		printf("Data is available now.\n");
-		/* FD_ISSET(0, &rfds) will be true. */
-	else
-		printf("No data within five seconds.\n");
-
-
-	return 0;
 }

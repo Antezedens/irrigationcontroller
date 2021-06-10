@@ -4,3 +4,4 @@ project(irrigation)
 set(CMAKE_CXX_STANDARD 14)
 
 add_executable(irrigation main.cpp Util.cpp)
+target_link_libraries(irrigation pthread)
